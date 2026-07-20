@@ -25,6 +25,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("pool error: %v", err)
 	}
+	// NotifyContext cancels ctx on SIGINT/SIGTERM. Container orchestrators
+	// send SIGTERM then SIGKILL after a grace period — draining in between
+	// is what makes deploys not drop requests.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	hc := router.NewHealthChecker(pool, cfg.HealthInterval, cfg.HealthTimeout)
+
+	// hcDone lets shutdown wait for the checker to finish its current cycle.
+	// A closed channel is the idiomatic "this is finished" broadcast: any
+	// number of receivers unblock, and it can't be signalled twice by accident.
+	hcDone := make(chan struct{})
+	go func() {
+		defer close(hcDone)
+		hc.Run(ctx)
+	}()
 
 	mux := http.NewServeMux()
 
@@ -34,6 +50,17 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok\n"))
+	})
+
+	// "Should a load balancer send us traffic?" With no healthy endpoint we
+	// can serve nothing useful, so we shed traffic without dying.
+	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+		if _, _, err := pool.Select(""); err != nil {
+			http.Error(w, "no healthy endpoints", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready\n"))
 	})
 
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
@@ -59,12 +86,6 @@ func main() {
 		IdleTimeout:       90 * time.Second,
 	}
 
-	// NotifyContext cancels ctx on SIGINT/SIGTERM. Container orchestrators
-	// send SIGTERM then SIGKILL after a grace period — draining in between
-	// is what makes deploys not drop requests.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
 		log.Printf("rpc-mesh listening on :%s with %d endpoint(s)", cfg.Port, len(cfg.Endpoints))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -81,5 +102,13 @@ func main() {
 		log.Printf("graceful shutdown failed: %v", err)
 		os.Exit(1)
 	}
+	// Order matters. Stopping the checker first would leave in-flight
+	// requests routing on health data that has stopped updating.
+	select {
+	case <-hcDone:
+	case <-time.After(3 * time.Second):
+		log.Println("health checker did not stop in time")
+	}
+
 	log.Println("stopped cleanly")
 }
