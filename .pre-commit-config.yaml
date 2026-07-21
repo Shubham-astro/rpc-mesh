@@ -37,7 +37,21 @@ repos:
 
       - id: golangci-lint
         name: golangci-lint
-        entry: golangci-lint run --fix --new-from-rev=HEAD
+        entry: bash -c 'export PATH="$(go env GOPATH)/bin:$PATH"; golangci-lint run'
         language: system
         pass_filenames: false
+        types: [go]
+
+      - id: gofumpt
+        name: gofumpt
+        entry: gofumpt -w -extra
+        language: golang
+        additional_dependencies: ['mvdan.cc/gofumpt@v0.7.0']
+        types: [go]
+
+      - id: goimports
+        name: goimports
+        entry: goimports -w -local github.com/your-org/rpc-mesh
+        language: golang
+        additional_dependencies: ['golang.org/x/tools/cmd/goimports@latest']
         types: [go]

@@ -10,11 +10,9 @@ import (
 	"github.com/shubham-astro/rpc-mesh/config"
 )
 
-var (
-	// ErrNoEndpoints means every endpoint is unhealthy. Callers must
-	// surface this as a 503 — there is nothing sane to fall back to.
-	ErrNoEndpoints = errors.New("router: no healthy endpoints available")
-)
+// ErrNoEndpoints means every endpoint is unhealthy. Callers must
+// surface this as a 503 — there is nothing sane to fall back to.
+var ErrNoEndpoints = errors.New("router: no healthy endpoints available")
 
 // Endpoint represents one upstream Solana RPC node.
 //
