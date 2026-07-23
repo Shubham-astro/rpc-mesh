@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shubham-astro/rpc-mesh/config"
+	"github.com/shubham-astro/rpc-mesh/metrics"
 	"github.com/shubham-astro/rpc-mesh/router"
 )
 
@@ -25,6 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("pool error: %v", err)
 	}
+
 	// NotifyContext cancels ctx on SIGINT/SIGTERM. Container orchestrators
 	// send SIGTERM then SIGKILL after a grace period — draining in between
 	// is what makes deploys not drop requests.
@@ -41,9 +43,19 @@ func main() {
 		defer close(hcDone)
 		hc.Run(ctx)
 	}()
-	
+
 	proxy := router.NewProxy(pool, cfg.UpstreamTimeout, cfg.MaxBodyBytes)
 	proxy.SetAllowOrigin(cfg.CORSAllowOrigin)
+
+	// ---- NEW: metrics ----
+	// Takes the pool so its collector can read endpoint state at scrape time
+	// rather than keeping a pushed copy that goes stale between health cycles.
+	m := metrics.New(pool)
+
+	// Injected rather than imported: `router` stays free of any Prometheus
+	// dependency, `metrics` imports `router`, and the dependency graph runs
+	// one direction with no cycle. Proxy tests still run against nopStats.
+	proxy.SetStats(m)
 
 	mux := http.NewServeMux()
 
@@ -56,6 +68,9 @@ func main() {
 	})
 
 	mux.Handle("/", proxy)
+
+	// ---- NEW ----
+	mux.Handle("GET /metrics", m.Handler())
 
 	// "Should a load balancer send us traffic?" With no healthy endpoint we
 	// can serve nothing useful, so we shed traffic without dying.
@@ -107,6 +122,7 @@ func main() {
 		log.Printf("graceful shutdown failed: %v", err)
 		os.Exit(1)
 	}
+
 	// Order matters. Stopping the checker first would leave in-flight
 	// requests routing on health data that has stopped updating.
 	select {
