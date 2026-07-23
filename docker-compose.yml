@@ -1,0 +1,37 @@
+services:
+  rpc-mesh:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      RPC_ENDPOINTS: "https://api.mainnet-beta.solana.com,https://solana-rpc.publicnode.com"
+      HEALTH_INTERVAL: "5s"
+      MAX_SLOT_LAG: "50"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 5s scrapes make slot lag legible on a dashboard. Fine for a local
+      # stack; you would not run this against a real fleet.
+      - --storage.tsdb.retention.time=6h
+    depends_on:
+      - rpc-mesh
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./deploy/grafana:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
