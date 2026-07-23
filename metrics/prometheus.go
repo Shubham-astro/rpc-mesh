@@ -1,0 +1,157 @@
+package metrics
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/shubham-astro/rpc-mesh/router"
+)
+
+// knownMethods bounds label cardinality on `method`.
+//
+// The method name comes from the request body, i.e. it is attacker-controlled.
+// Without an allowlist, a loop posting {"method":"random-string-N"} mints a new
+// time series per request until the TSDB dies. Anything unrecognized becomes
+// "other".
+var knownMethods = map[string]struct{}{
+	"getAccountInfo": {}, "getBalance": {}, "getBlock": {}, "getBlockCommitment": {},
+	"getBlockHeight": {}, "getBlockProduction": {}, "getBlockTime": {}, "getBlocks": {},
+	"getBlocksWithLimit": {}, "getClusterNodes": {}, "getEpochInfo": {},
+	"getEpochSchedule": {}, "getFeeForMessage": {}, "getFirstAvailableBlock": {},
+	"getGenesisHash": {}, "getHealth": {}, "getHighestSnapshotSlot": {},
+	"getIdentity": {}, "getInflationGovernor": {}, "getInflationRate": {},
+	"getInflationReward": {}, "getLargestAccounts": {}, "getLatestBlockhash": {},
+	"getLeaderSchedule": {}, "getMaxRetransmitSlot": {}, "getMaxShredInsertSlot": {},
+	"getMinimumBalanceForRentExemption": {}, "getMultipleAccounts": {},
+	"getProgramAccounts": {}, "getRecentPerformanceSamples": {},
+	"getRecentPrioritizationFees": {}, "getSignatureStatuses": {},
+	"getSignaturesForAddress": {}, "getSlot": {}, "getSlotLeader": {},
+	"getSlotLeaders": {}, "getStakeMinimumDelegation": {}, "getSupply": {},
+	"getTokenAccountBalance": {}, "getTokenAccountsByDelegate": {},
+	"getTokenAccountsByOwner": {}, "getTokenLargestAccounts": {}, "getTokenSupply": {},
+	"getTransaction": {}, "getTransactionCount": {}, "getVersion": {},
+	"getVoteAccounts": {}, "isBlockhashValid": {}, "minimumLedgerSlot": {},
+	"requestAirdrop": {}, "sendTransaction": {}, "simulateTransaction": {},
+	// Sentinels produced by peekMethod itself.
+	"batch": {}, "unknown": {},
+}
+
+func normalizeMethod(m string) string {
+	if _, ok := knownMethods[m]; ok {
+		return m
+	}
+	return "other"
+}
+
+// Metrics implements router.ProxyStats.
+type Metrics struct {
+	registry *prometheus.Registry
+
+	requests   *prometheus.CounterVec
+	duration   *prometheus.HistogramVec
+	errors     *prometheus.CounterVec
+	degraded   *prometheus.CounterVec
+	retries    *prometheus.CounterVec
+}
+
+func New(pool *router.Pool) *Metrics {
+	// A private registry rather than the default one. The default is package
+	// global — any dependency that calls MustRegister at init can panic on a
+	// duplicate, and tests that build two Metrics values collide. Explicit
+	// registry, explicit collectors, no action at a distance.
+	reg := prometheus.NewRegistry()
+
+	m := &Metrics{
+		registry: reg,
+
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rpcmesh_requests_total",
+			Help: "Total proxied JSON-RPC requests by upstream endpoint, method and response status.",
+		}, []string{"endpoint", "method", "status"}),
+
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "rpcmesh_request_duration_seconds",
+			Help: "End-to-end proxied request latency, including any retry.",
+			// Default buckets top out at 10s and are far too coarse at the
+			// low end. Solana reads land between 20ms and 300ms, which the
+			// defaults compress into two buckets. These resolve the range
+			// that matters and still catch the tail.
+			Buckets: []float64{
+				0.005, 0.010, 0.025, 0.050, 0.075, 0.100,
+				0.150, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+			},
+		}, []string{"endpoint", "method"}),
+
+		errors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rpcmesh_upstream_errors_total",
+			Help: "Upstream failures by reason (timeout, rate_limited, upstream_5xx, transport, no_endpoints).",
+		}, []string{"endpoint", "method", "reason"}),
+
+		degraded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rpcmesh_degraded_requests_total",
+			Help: "Requests served by a slot-lagging endpoint because no current endpoint was available.",
+		}, []string{"endpoint", "method"}),
+
+		retries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rpcmesh_retries_total",
+			Help: "Read requests retried on a different endpoint after an upstream failure.",
+		}, []string{"from_endpoint", "to_endpoint", "method"}),
+	}
+
+	reg.MustRegister(
+		m.requests, m.duration, m.errors, m.degraded, m.retries,
+		newPoolCollector(pool),
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
+	return m
+}
+
+func (m *Metrics) Handler() http.Handler {
+	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{
+		// Surface collector bugs during development instead of silently
+		// serving a partial scrape.
+		ErrorHandling: promhttp.HTTPErrorOnError,
+	})
+}
+
+// --- router.ProxyStats ---
+
+func (m *Metrics) ObserveRequest(endpoint, method string, status int, d time.Duration) {
+	mm := normalizeMethod(method)
+	m.requests.WithLabelValues(endpoint, mm, statusLabel(status)).Inc()
+	m.duration.WithLabelValues(endpoint, mm).Observe(d.Seconds())
+}
+
+func (m *Metrics) ObserveUpstreamError(endpoint, method, reason string) {
+	m.errors.WithLabelValues(endpoint, normalizeMethod(method), reason).Inc()
+}
+
+func (m *Metrics) ObserveDegraded(endpoint, method string) {
+	m.degraded.WithLabelValues(endpoint, normalizeMethod(method)).Inc()
+}
+
+func (m *Metrics) ObserveRetry(from, to, method string) {
+	m.retries.WithLabelValues(from, to, normalizeMethod(method)).Inc()
+}
+
+// statusLabel keeps the status label to a handful of values. Exact codes add
+// cardinality without adding meaning — nobody alerts on 502 vs 504
+// specifically, and the reason label on errors already carries that detail.
+func statusLabel(code int) string {
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 200 && code < 300:
+		return "2xx"
+	default:
+		return "other"
+	}
+}
