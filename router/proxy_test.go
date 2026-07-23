@@ -340,4 +340,48 @@ func TestProxyDoesNotTruncateLargeResponses(t *testing.T) {
 	}
 }
 
+func TestNearEqualLatenciesShareTraffic(t *testing.T) {
+	// 640ms vs 790ms is a 1.23x gap — inside the tie band, and roughly what
+	// two healthy public endpoints actually measure. Routing 100% of traffic
+	// on a difference that small is overconfident in a noisy signal.
+	a := ep("a", true, 1000, 640*time.Millisecond)
+	b := ep("b", true, 1000, 790*time.Millisecond)
+
+	p := testPool(t, a, b)
+	p.maxSlot = 1000
+
+	counts := map[string]int{}
+	for i := 0; i < 1000; i++ {
+		got, _, err := p.Select("getSlot")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		counts[got.Name]++
+	}
+
+	if counts["b"] < 350 {
+		t.Errorf("b selected %d/1000; near-equal endpoints should share traffic", counts["b"])
+	}
+}
+
+func TestClearlySlowerEndpointIsAvoided(t *testing.T) {
+	// 100ms vs 500ms is a 5x gap — well outside the band, so the tie
+	// randomization must not kick in and dilute a real signal.
+	fast := ep("fast", true, 1000, 100*time.Millisecond)
+	slow := ep("slow", true, 1000, 500*time.Millisecond)
+
+	p := testPool(t, fast, slow)
+	p.maxSlot = 1000
+
+	for i := 0; i < 200; i++ {
+		got, _, err := p.Select("getSlot")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Name != "fast" {
+			t.Fatalf("selected %q; a 5x gap is not a tie", got.Name)
+		}
+	}
+}
+
 var _ = io.Discard // keep io imported for future streaming assertions
