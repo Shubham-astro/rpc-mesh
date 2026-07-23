@@ -16,6 +16,20 @@ var (
 	ErrNoEndpoints = errors.New("router: no healthy endpoints available")
 )
 
+// nearTieRatio treats two endpoints as equivalent when the slower is within
+// this factor of the faster.
+//
+// Probe RTT is a noisy signal: two sequential RPC calls over solana-go's own
+// transport, EWMA-smoothed but not precise. Strict comparison on a noisy
+// metric is winner-take-all — a 20% measured gap that is really jitter sends
+// 100% of traffic to one endpoint, exhausting its rate limit while the others
+// idle, and leaving their latency data low-resolution because only health
+// probes ever refresh it.
+//
+// Within the band we randomize; beyond it the gap is large enough to act on.
+// 1.25 is a starting point, not a tuned value — cmd/bench should sweep it.
+const nearTieRatio = 1.25
+
 // Endpoint represents one upstream Solana RPC node.
 //
 // Exported fields are immutable after construction and safe to read
@@ -156,7 +170,8 @@ func (p *Pool) SelectExcluding(method string, exclude *Endpoint) (*Endpoint, boo
 }
 
 // pickBest selects using the power-of-two-choices algorithm: sample two
-// distinct candidates at random and route to whichever has the lower EWMA.
+// distinct candidates at random and route to whichever has the lower EWMA,
+// treating near-equal latencies as a tie (see nearTieRatio).
 //
 // Strict lowest-EWMA-wins is winner-take-all — one endpoint absorbs 100% of
 // traffic until its measured latency rises above the runner-up's, which on a
@@ -164,10 +179,11 @@ func (p *Pool) SelectExcluding(method string, exclude *Endpoint) (*Endpoint, boo
 // the others idle. It also leaves the unused endpoints' latency data
 // low-resolution, since only health probes ever update them.
 //
-// P2C keeps the tail latency close to "always pick the fastest" while
-// spreading load across the pool roughly in proportion to speed. With N
-// candidates the fastest wins whenever it is sampled — 2/N of pairings — and
-// the slowest wins only against something slower still.
+// P2C keeps tail latency close to "always pick the fastest" while spreading
+// load across the pool roughly in proportion to speed. Note that it only does
+// useful work at N >= 3: with exactly two candidates both are always sampled,
+// so the comparison is unconditional and the tie band is what does the
+// spreading.
 //
 // An unprobed endpoint (ewma == 0) is treated as maxDuration rather than zero;
 // zero would make every unprobed endpoint beat every measured one. At startup
@@ -194,21 +210,33 @@ func pickBest(candidates []*Endpoint) *Endpoint {
 	return faster(candidates[i], candidates[j])
 }
 
+// faster returns the better of two endpoints, or a random one when their
+// latencies are within nearTieRatio of each other.
 func faster(a, b *Endpoint) *Endpoint {
 	la, lb := effectiveLatency(a), effectiveLatency(b)
-	switch {
-	case la < lb:
-		return a
-	case lb < la:
-		return b
-	default:
-		// Equal — including the all-unprobed case at startup. Random, so
-		// cold-start load spreads instead of concentrating on one endpoint.
-		if rand.IntN(2) == 0 {
-			return a
+
+	if la != lb {
+		lo, hi := la, lb
+		if lb < la {
+			lo, hi = lb, la
 		}
-		return b
+		// No overflow risk in the multiplication: lo can only be maxDuration
+		// if both are, and that case is equal so it never reaches here.
+		if hi > time.Duration(float64(lo)*nearTieRatio) {
+			if la < lb {
+				return a
+			}
+			return b
+		}
 	}
+
+	// Equal, or close enough that the difference is probably measurement
+	// noise. Random, so load spreads instead of concentrating on whichever
+	// endpoint happened to measure a few milliseconds faster this cycle.
+	if rand.IntN(2) == 0 {
+		return a
+	}
+	return b
 }
 
 func effectiveLatency(ep *Endpoint) time.Duration {
