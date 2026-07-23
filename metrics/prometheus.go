@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,15 +48,53 @@ func normalizeMethod(m string) string {
 	return "other"
 }
 
+// knownRPCErrorCodes bounds cardinality on the `code` label. The code comes
+// from the upstream rather than the client, so the exposure is smaller than
+// with method names — but a misbehaving or hostile provider could still emit
+// arbitrary integers, and the same allowlist discipline costs nothing.
+//
+// -32700..-32600 are standard JSON-RPC; -32016..-32001 are Solana's.
+var knownRPCErrorCodes = map[int]struct{}{
+	-32700: {}, // parse error
+	-32600: {}, // invalid request
+	-32601: {}, // method not found
+	-32602: {}, // invalid params
+	-32603: {}, // internal error
+	-32001: {}, // block cleaned up
+	-32002: {}, // send transaction preflight failure
+	-32003: {}, // transaction signature verification failure
+	-32004: {}, // block not available
+	-32005: {}, // node unhealthy
+	-32006: {}, // transaction precompile verification failure
+	-32007: {}, // slot skipped
+	-32008: {}, // no snapshot
+	-32009: {}, // long-term storage slot skipped
+	-32010: {}, // key excluded from secondary index
+	-32011: {}, // transaction history not available
+	-32012: {}, // scan error
+	-32013: {}, // transaction signature length mismatch
+	-32014: {}, // block status not yet available
+	-32015: {}, // unsupported transaction version
+	-32016: {}, // minimum context slot not reached
+}
+
+func codeLabel(code int) string {
+	if _, ok := knownRPCErrorCodes[code]; ok {
+		return strconv.Itoa(code)
+	}
+	return "other"
+}
+
 // Metrics implements router.ProxyStats.
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests   *prometheus.CounterVec
-	duration   *prometheus.HistogramVec
-	errors     *prometheus.CounterVec
-	degraded   *prometheus.CounterVec
-	retries    *prometheus.CounterVec
+	requests  *prometheus.CounterVec
+	duration  *prometheus.HistogramVec
+	errors    *prometheus.CounterVec
+	rpcErrors *prometheus.CounterVec
+	degraded  *prometheus.CounterVec
+	retries   *prometheus.CounterVec
 }
 
 func New(pool *router.Pool) *Metrics {
@@ -70,7 +109,7 @@ func New(pool *router.Pool) *Metrics {
 
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "rpcmesh_requests_total",
-			Help: "Total proxied JSON-RPC requests by upstream endpoint, method and response status.",
+			Help: "Total proxied JSON-RPC requests by upstream endpoint, method and HTTP response status.",
 		}, []string{"endpoint", "method", "status"}),
 
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -88,8 +127,13 @@ func New(pool *router.Pool) *Metrics {
 
 		errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "rpcmesh_upstream_errors_total",
-			Help: "Upstream failures by reason (timeout, rate_limited, upstream_5xx, transport, no_endpoints).",
+			Help: "Transport or HTTP-level upstream failures by reason (timeout, rate_limited, upstream_5xx, transport, no_endpoints).",
 		}, []string{"endpoint", "method", "reason"}),
+
+		rpcErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "rpcmesh_rpc_errors_total",
+			Help: "JSON-RPC application errors returned inside a 2xx response body. These are invisible to rpcmesh_requests_total, which only sees HTTP status.",
+		}, []string{"endpoint", "method", "code"}),
 
 		degraded: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "rpcmesh_degraded_requests_total",
@@ -103,7 +147,7 @@ func New(pool *router.Pool) *Metrics {
 	}
 
 	reg.MustRegister(
-		m.requests, m.duration, m.errors, m.degraded, m.retries,
+		m.requests, m.duration, m.errors, m.rpcErrors, m.degraded, m.retries,
 		newPoolCollector(pool),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -130,6 +174,10 @@ func (m *Metrics) ObserveRequest(endpoint, method string, status int, d time.Dur
 
 func (m *Metrics) ObserveUpstreamError(endpoint, method, reason string) {
 	m.errors.WithLabelValues(endpoint, normalizeMethod(method), reason).Inc()
+}
+
+func (m *Metrics) ObserveRPCError(endpoint, method string, code int) {
+	m.rpcErrors.WithLabelValues(endpoint, normalizeMethod(method), codeLabel(code)).Inc()
 }
 
 func (m *Metrics) ObserveDegraded(endpoint, method string) {

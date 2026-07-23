@@ -22,12 +22,12 @@ import (
 type poolCollector struct {
 	pool *router.Pool
 
-	healthy   *prometheus.Desc
-	slot      *prometheus.Desc
-	slotLag   *prometheus.Desc
-	latency   *prometheus.Desc
-	checkAge  *prometheus.Desc
-	maxSlot   *prometheus.Desc
+	healthy  *prometheus.Desc
+	slot     *prometheus.Desc
+	slotLag  *prometheus.Desc
+	probeRTT *prometheus.Desc
+	checkAge *prometheus.Desc
+	maxSlot  *prometheus.Desc
 }
 
 func newPoolCollector(pool *router.Pool) *poolCollector {
@@ -45,9 +45,14 @@ func newPoolCollector(pool *router.Pool) *poolCollector {
 			"rpcmesh_endpoint_slot_lag",
 			"Slots behind the highest slot observed across the pool.",
 			[]string{"endpoint"}, nil),
-		latency: prometheus.NewDesc(
-			"rpcmesh_endpoint_probe_latency_seconds",
-			"EWMA-smoothed health probe latency used for routing decisions.",
+		// Not comparable to rpcmesh_request_duration_seconds. A probe is two
+		// sequential RPC calls (getHealth then getSlot) over solana-go's own
+		// untuned transport, so it runs roughly 2-4x a single proxied
+		// request. It is a relative signal for ranking endpoints against each
+		// other, not an estimate of client-visible latency.
+		probeRTT: prometheus.NewDesc(
+			"rpcmesh_endpoint_probe_rtt_seconds",
+			"EWMA-smoothed round trip time of a health probe (two sequential RPC calls). Used to rank endpoints; not comparable to proxied request latency.",
 			[]string{"endpoint"}, nil),
 		checkAge: prometheus.NewDesc(
 			"rpcmesh_endpoint_last_check_age_seconds",
@@ -64,7 +69,7 @@ func (c *poolCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.healthy
 	ch <- c.slot
 	ch <- c.slotLag
-	ch <- c.latency
+	ch <- c.probeRTT
 	ch <- c.checkAge
 	ch <- c.maxSlot
 }
@@ -84,7 +89,7 @@ func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
 		g(c.healthy, healthy)
 		g(c.slot, float64(st.Slot))
 		g(c.slotLag, float64(st.SlotLag))
-		g(c.latency, st.EWMALatency.Seconds())
+		g(c.probeRTT, st.EWMALatency.Seconds())
 
 		if !st.LastChecked.IsZero() {
 			g(c.checkAge, now.Sub(st.LastChecked).Seconds())

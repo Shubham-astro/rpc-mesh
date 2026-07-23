@@ -14,6 +14,20 @@ import (
 	"time"
 )
 
+// maxPeekBytes bounds how much of an upstream response we buffer to look for a
+// JSON-RPC application error.
+//
+// JSON-RPC signals application failures in the body with HTTP 200, so status
+// code alone tells us nothing about whether the call succeeded — "method not
+// found", "node unhealthy", and a failed transaction simulation all arrive as
+// 2xx. Without inspecting the body, every application-level failure is
+// invisible to metrics.
+//
+// Error payloads are small. Buffering only the first few KB keeps the
+// streaming path intact for a 30MB getProgramAccounts result, which never
+// needs inspecting.
+const maxPeekBytes = 4096
+
 // writeMethods are JSON-RPC methods that must never be retried.
 //
 // A timeout on sendTransaction is ambiguous: the transaction may already be
@@ -26,14 +40,18 @@ var writeMethods = map[string]bool{
 	"simulateTransaction": false, // read-only despite the name; safe to retry
 }
 
-// ProxyStats is a hook for metrics (wired up on Day 5). Keeping it as an
-// interface means the hot path has no Prometheus dependency and tests can
-// assert on routing decisions without scraping a registry.
+// ProxyStats is the metrics hook. Keeping it as an interface means the hot
+// path has no Prometheus dependency and tests can assert on routing decisions
+// without scraping a registry.
 type ProxyStats interface {
 	ObserveRequest(endpoint, method string, status int, duration time.Duration)
 	ObserveUpstreamError(endpoint, method, reason string)
 	ObserveDegraded(endpoint, method string)
 	ObserveRetry(fromEndpoint, toEndpoint, method string)
+	// ObserveRPCError records a JSON-RPC application error returned inside a
+	// 2xx response body. Distinct from ObserveUpstreamError, which is a
+	// transport or HTTP-level failure.
+	ObserveRPCError(endpoint, method string, code int)
 }
 
 type nopStats struct{}
@@ -42,6 +60,7 @@ func (nopStats) ObserveRequest(string, string, int, time.Duration) {}
 func (nopStats) ObserveUpstreamError(string, string, string)       {}
 func (nopStats) ObserveDegraded(string, string)                    {}
 func (nopStats) ObserveRetry(string, string, string)               {}
+func (nopStats) ObserveRPCError(string, string, int)               {}
 
 type Proxy struct {
 	pool         *Pool
@@ -96,6 +115,8 @@ func NewProxy(pool *Pool, upstreamTimeout time.Duration, maxBodyBytes int64) *Pr
 	}
 }
 
+// SetStats installs a metrics implementation. Call before serving traffic; it
+// writes a field every request reads.
 func (p *Proxy) SetStats(s ProxyStats) {
 	if s != nil {
 		p.stats = s
@@ -113,7 +134,7 @@ func (p *Proxy) SetAllowOrigin(origin string) {
 // rpcPeek extracts just enough of the JSON-RPC envelope to route on.
 //
 // encoding/json ignores fields not present in the target struct, so this
-// decodes a 2MB request body into two small fields without materializing
+// decodes a 2MB request body into one small field without materializing
 // the rest. Full unmarshal-then-remarshal would cost allocation on every
 // request and break whenever Solana adds a field.
 type rpcPeek struct {
@@ -143,6 +164,39 @@ func isRetryable(method string, isBatch bool) bool {
 		return false
 	}
 	return !writeMethods[method]
+}
+
+// rpcErrorPeek matches only the error member of a JSON-RPC response.
+// A pointer so we can distinguish "absent" from "present but zero".
+type rpcErrorPeek struct {
+	Error *struct {
+		Code int `json:"code"`
+	} `json:"error"`
+}
+
+// peekRPCError buffers up to maxPeekBytes of the response and reports any
+// JSON-RPC error code found.
+//
+// Returns the bytes it consumed so the caller can write them before resuming
+// the stream — the reader is one-shot, so what we read we must forward. If the
+// body is larger than the peek window we skip parsing entirely: a response
+// that big is a successful result, not an error object.
+func peekRPCError(body io.Reader) (consumed []byte, code int, found bool) {
+	buf := make([]byte, maxPeekBytes)
+	n, _ := io.ReadFull(body, buf)
+	consumed = buf[:n]
+
+	// n == maxPeekBytes means we hit the window before EOF, so `consumed` is
+	// a truncated prefix and won't parse. Forward it untouched.
+	if n == 0 || n == maxPeekBytes {
+		return consumed, 0, false
+	}
+
+	var peek rpcErrorPeek
+	if err := json.Unmarshal(consumed, &peek); err != nil || peek.Error == nil {
+		return consumed, 0, false
+	}
+	return consumed, peek.Error.Code, true
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -235,6 +289,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Inspect the head of the body before forwarding any of it. Must happen
+	// before WriteHeader — once the status is sent we can no longer react.
+	peeked, rpcCode, hasRPCErr := peekRPCError(resp.Body)
+	if hasRPCErr {
+		p.stats.ObserveRPCError(ep.Name, method, rpcCode)
+		w.Header().Set("X-RPC-Mesh-RPC-Error", "true")
+	}
+
 	// Surface which endpoint served this. Invaluable when debugging "why did
 	// this one request return stale data" — and it costs nothing.
 	w.Header().Set("X-RPC-Mesh-Endpoint", ep.Name)
@@ -244,10 +306,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	// io.Copy streams the response through without buffering it. A
-	// getProgramAccounts response can be tens of megabytes; buffering would
-	// spike memory proportional to concurrency for no benefit.
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	// Write back what the peek consumed, then stream the remainder. io.Copy
+	// avoids buffering the rest: a getProgramAccounts response can be tens of
+	// megabytes, and buffering would spike memory proportional to concurrency
+	// for no benefit.
+	if _, err := w.Write(peeked); err != nil {
+		log.Printf("writing peeked response from %s: %v", ep.Name, err)
+	} else if _, err := io.Copy(w, resp.Body); err != nil {
 		// Headers are already sent, so we cannot convert this into an error
 		// response. Log and move on.
 		log.Printf("streaming response from %s: %v", ep.Name, err)
@@ -264,7 +329,8 @@ func (p *Proxy) setCORS(w http.ResponseWriter) {
 	h.Set("Access-Control-Max-Age", "86400")
 	// Without this, browser JS cannot read our custom headers even though
 	// they arrive on the wire.
-	h.Set("Access-Control-Expose-Headers", "X-RPC-Mesh-Endpoint, X-RPC-Mesh-Degraded")
+	h.Set("Access-Control-Expose-Headers",
+		"X-RPC-Mesh-Endpoint, X-RPC-Mesh-Degraded, X-RPC-Mesh-RPC-Error")
 	if p.allowOrigin != "*" {
 		// Responses vary by request origin, so caches must not serve one
 		// origin's response to another.

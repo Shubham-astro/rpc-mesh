@@ -124,8 +124,9 @@ func (p *Pool) Select(method string) (*Endpoint, bool, error) {
 // slot-current and we fell back to a healthy-but-lagging one — the caller
 // should log/count this, because it means clients may see stale state.
 //
-// `method` is unused in v1. It's the seam for sendTransaction routing on Day 4;
-// taking it now avoids touching every call site later.
+// `method` is currently unused for endpoint choice; it is the seam for
+// method-aware routing (pinning sendTransaction, sending expensive calls to a
+// paid tier). Taking it now avoids touching every call site later.
 func (p *Pool) SelectExcluding(method string, exclude *Endpoint) (*Endpoint, bool, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -144,43 +145,70 @@ func (p *Pool) SelectExcluding(method string, exclude *Endpoint) (*Endpoint, boo
 	}
 
 	if len(current) > 0 {
-		return pickFastest(current), false, nil
+		return pickBest(current), false, nil
 	}
 	// Availability beats freshness for most read methods. Serve it, but
 	// tell the caller so it can be counted and alerted on.
 	if len(lagging) > 0 {
-		return pickFastest(lagging), true, nil
+		return pickBest(lagging), true, nil
 	}
 	return nil, false, ErrNoEndpoints
 }
 
-// pickFastest returns the lowest-EWMA candidate, breaking ties randomly.
+// pickBest selects using the power-of-two-choices algorithm: sample two
+// distinct candidates at random and route to whichever has the lower EWMA.
 //
-// An unprobed endpoint (ewma == 0) is treated as maxDuration rather than zero.
-// Zero would make every unprobed endpoint beat every measured one. At startup
-// all endpoints are unprobed, so all tie at maxDuration and the random
-// tie-break spreads initial load instead of hammering endpoints[0].
+// Strict lowest-EWMA-wins is winner-take-all — one endpoint absorbs 100% of
+// traffic until its measured latency rises above the runner-up's, which on a
+// pool of free-tier providers means hitting one endpoint's rate limit while
+// the others idle. It also leaves the unused endpoints' latency data
+// low-resolution, since only health probes ever update them.
+//
+// P2C keeps the tail latency close to "always pick the fastest" while
+// spreading load across the pool roughly in proportion to speed. With N
+// candidates the fastest wins whenever it is sampled — 2/N of pairings — and
+// the slowest wins only against something slower still.
+//
+// An unprobed endpoint (ewma == 0) is treated as maxDuration rather than zero;
+// zero would make every unprobed endpoint beat every measured one. At startup
+// all endpoints tie at maxDuration and the random tie-break spreads initial
+// load instead of hammering endpoints[0].
 //
 // Caller must hold at least a read lock.
-func pickFastest(candidates []*Endpoint) *Endpoint {
-	best := time.Duration(math.MaxInt64)
-	for _, ep := range candidates {
-		if l := effectiveLatency(ep); l < best {
-			best = l
-		}
+func pickBest(candidates []*Endpoint) *Endpoint {
+	switch len(candidates) {
+	case 1:
+		return candidates[0]
+	case 2:
+		return faster(candidates[0], candidates[1])
 	}
 
-	tied := candidates[:0:0] // new backing array; don't alias the caller's slice
-	for _, ep := range candidates {
-		if effectiveLatency(ep) == best {
-			tied = append(tied, ep)
-		}
+	// Two distinct indices without rejection sampling: draw j from a range
+	// one smaller, then shift it past i. Uniform over all ordered pairs,
+	// and it can't loop.
+	i := rand.IntN(len(candidates))
+	j := rand.IntN(len(candidates) - 1)
+	if j >= i {
+		j++
 	}
+	return faster(candidates[i], candidates[j])
+}
 
-	if len(tied) == 1 {
-		return tied[0]
+func faster(a, b *Endpoint) *Endpoint {
+	la, lb := effectiveLatency(a), effectiveLatency(b)
+	switch {
+	case la < lb:
+		return a
+	case lb < la:
+		return b
+	default:
+		// Equal — including the all-unprobed case at startup. Random, so
+		// cold-start load spreads instead of concentrating on one endpoint.
+		if rand.IntN(2) == 0 {
+			return a
+		}
+		return b
 	}
-	return tied[rand.IntN(len(tied))]
 }
 
 func effectiveLatency(ep *Endpoint) time.Duration {

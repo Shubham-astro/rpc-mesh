@@ -20,6 +20,7 @@ type fakeRPC struct {
 	requests atomic.Int32
 	status   atomic.Int32
 	delay    atomic.Int64 // nanoseconds
+	body     atomic.Pointer[string]
 }
 
 func newFakeRPC(t *testing.T, name string) *fakeRPC {
@@ -41,6 +42,10 @@ func newFakeRPC(t *testing.T, name string) *fakeRPC {
 		code := int(f.status.Load())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
+		if custom := f.body.Load(); custom != nil {
+			io.WriteString(w, *custom)
+			return
+		}
 		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":"%s"}`, name)
 	}))
 	t.Cleanup(f.server.Close)
@@ -282,6 +287,56 @@ func TestProxyPropagatesClientCancellation(t *testing.T) {
 
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("took %v — client cancellation not propagated upstream", elapsed)
+	}
+}
+
+func TestProxyCountsJSONRPCErrorInside200(t *testing.T) {
+	// The blind spot this closes: JSON-RPC reports application failures with
+	// HTTP 200, so status-based metrics show 100% success while every client
+	// call fails.
+	backend := newFakeRPC(t, "backend")
+	errBody := `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`
+	backend.body.Store(&errBody)
+
+	e := ep("backend", true, 1000, 10*time.Millisecond)
+	e.URL = backend.server.URL
+	p := testPool(t, e)
+	p.maxSlot = 1000
+
+	rec := post(t, newTestProxy(t, p), `{"jsonrpc":"2.0","id":1,"method":"nope"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — the error is in the body, not the status", rec.Code)
+	}
+	if rec.Header().Get("X-RPC-Mesh-RPC-Error") != "true" {
+		t.Error("JSON-RPC error not detected")
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "-32601") {
+		t.Errorf("body was altered by the peek: %q", got)
+	}
+}
+
+func TestProxyDoesNotTruncateLargeResponses(t *testing.T) {
+	// A response larger than maxPeekBytes takes the "read the window, don't
+	// parse, forward everything" path. If the peeked prefix and the streamed
+	// remainder don't join cleanly, every large getProgramAccounts result is
+	// silently corrupted.
+	backend := newFakeRPC(t, "backend")
+	large := `{"jsonrpc":"2.0","id":1,"result":"` + strings.Repeat("x", maxPeekBytes*3) + `"}`
+	backend.body.Store(&large)
+
+	e := ep("backend", true, 1000, 10*time.Millisecond)
+	e.URL = backend.server.URL
+	p := testPool(t, e)
+	p.maxSlot = 1000
+
+	rec := post(t, newTestProxy(t, p), `{"jsonrpc":"2.0","id":1,"method":"getProgramAccounts"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != large {
+		t.Errorf("response corrupted: got %d bytes, want %d", len(got), len(large))
 	}
 }
 
