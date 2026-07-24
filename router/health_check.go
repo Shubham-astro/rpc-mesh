@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/gagliardetto/solana-go/rpc/jsonrpc"
 )
 
 // ProbeFunc performs one health probe against an endpoint and returns the
@@ -36,12 +39,46 @@ func NewHealthChecker(pool *Pool, interval, timeout time.Duration) *HealthChecke
 		clients:  make(map[string]*rpc.Client),
 	}
 
-	// One client per endpoint, created once. Each rpc.Client owns an HTTP
-	// client with its own connection pool — creating one per probe would
-	// mean a fresh TCP + TLS handshake every cycle, which is exactly the
-	// latency we're supposed to be eliminating.
+	// solana-go defaults to http.DefaultTransport, which caps idle
+	// connections at 2 per host. Probes then intermittently pay a fresh TCP
+	// and TLS handshake, and that cost lands in the latency we route on —
+	// so the "slow" endpoint may just be the one whose keep-alives happened
+	// to expire. Measure the endpoint, not our own connection churn.
+	//
+	// Same reasoning as the proxy transport, but a separate instance: probe
+	// traffic should not compete with request traffic for connections, and
+	// the timeouts differ.
+	probeTransport := &http.Transport{
+		MaxIdleConnsPerHost: 4,
+		MaxIdleConns:        32,
+		// Longer than the health interval so a connection survives between
+		// cycles. If it expired every cycle we would be back to measuring
+		// handshakes.
+		IdleConnTimeout: 5 * time.Minute,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 3 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	probeHTTP := &http.Client{
+		Transport: probeTransport,
+		// No Timeout here — each probe carries its own context deadline,
+		// and a client-level timeout would shadow it with a worse error.
+	}
+
+	// One rpc.Client per endpoint, all sharing probeHTTP. The transport pools
+	// connections per host internally, so a shared client doesn't make
+	// endpoints contend — and creating a client per probe would mean a fresh
+	// TCP + TLS handshake every cycle, which is exactly the latency we're
+	// trying not to measure.
 	for _, ep := range pool.Endpoints() {
-		hc.clients[ep.URL] = rpc.New(ep.URL)
+		hc.clients[ep.URL] = rpc.NewWithCustomRPCClient(
+			jsonrpc.NewClientWithOpts(ep.URL, &jsonrpc.RPCClientOpts{
+				HTTPClient: probeHTTP,
+			}),
+		)
 	}
 
 	hc.probe = hc.defaultProbe
