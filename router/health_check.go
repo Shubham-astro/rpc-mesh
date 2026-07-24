@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -172,6 +173,10 @@ func (hc *HealthChecker) defaultProbe(ctx context.Context, ep *Endpoint) (uint64
 	// caught up with the cluster. It's cheap and catches nodes that are
 	// serving but knowingly behind.
 	if _, err := client.GetHealth(ctx); err != nil {
+		var rpcErr *jsonrpc.RPCError
+		if errors.As(err, &rpcErr) {
+			return 0, fmt.Errorf("getHealth: rpc error %d: %s", rpcErr.Code, rpcErr.Message)
+		}
 		return 0, fmt.Errorf("getHealth: %w", err)
 	}
 

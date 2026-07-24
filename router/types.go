@@ -247,10 +247,17 @@ func effectiveLatency(ep *Endpoint) time.Duration {
 }
 
 // slotLagLocked returns how far behind the cluster head this endpoint is.
-// Guards against underflow: an endpoint can briefly report a slot higher
+//
+// Reports 0 for an endpoint that has never reported a slot. Otherwise the lag
+// would be the entire chain height (~434M), which is not a lag — it is the
+// absence of a measurement. That value wrecks the y-axis of any dashboard
+// graphing lag across endpoints and makes lag-threshold alerts fire forever on
+// a dead endpoint, where the correct signal is rpcmesh_endpoint_healthy.
+//
+// Also guards against underflow: an endpoint can briefly report a slot higher
 // than the maxSlot computed on the previous cycle.
 func (p *Pool) slotLagLocked(ep *Endpoint) uint64 {
-	if ep.slot >= p.maxSlot {
+	if ep.slot == 0 || ep.slot >= p.maxSlot {
 		return 0
 	}
 	return p.maxSlot - ep.slot
